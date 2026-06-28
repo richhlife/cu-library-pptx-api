@@ -25,12 +25,26 @@ class Deck(BaseModel):
     bookName: str = "Board Package"
     theme: Dict[str, Any] = {}
     period: Dict[str, Any] = {}
+    sections: List[str] = []
+    narrative: str = ""
     headline: List[Dict[str, Any]] = []
     balanceSheet: List[Dict[str, Any]] = []
     incomeStatement: List[Dict[str, Any]] = []
+    spread: List[Dict[str, Any]] = []
+    loanTrend: List[Dict[str, Any]] = []
+    shareTrend: List[Dict[str, Any]] = []
     lending: Dict[str, Any] = {}
+    lendingNarrative: str = ""
     ops: Dict[str, Any] = {}
+    ceoNarrative: str = ""
     ceoHighlights: List[str] = []
+    agenda: Dict[str, Any] = {}
+    actionItems: List[Dict[str, Any]] = []
+    securedSections: List[Dict[str, Any]] = []
+    emerald: Dict[str, Any] = {}
+    calendar: List[Any] = []
+    execs: List[Any] = []
+    acronyms: List[Any] = []
 
 
 @app.get("/")
