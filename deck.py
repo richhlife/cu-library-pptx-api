@@ -423,41 +423,12 @@ def build(p):
             try: return POSc if float(a) >= float(b) else NEGc
             except Exception: return None
 
-        # highlights tiles
+        # highlights tiles \u2014 trust the payload headline exactly (no invented values)
         s, top = page("Financial Highlights")
-        _raw_hl = p.get("headline") or []
-        print("[highlights] incoming headline count=%d labels=%s" % (
-            len(_raw_hl), [h.get("label") for h in _raw_hl]), flush=True)
-        hl = _raw_hl[:4]
-        tiles = [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in hl
-                 if (h.get("label") or h.get("value"))]
-        if len(tiles) < 4:
-            # supplement from the statements so we never fall back to stale/placeholder labels
-            bs = [r for r in (p.get("balanceSheet") or [])]
-            isr = [r for r in (p.get("incomeStatement") or [])]
-            def find(rows, *keys):
-                for k in keys:
-                    for r in rows:
-                        if k in str(r.get("label", "")).lower(): return r
-                return None
-            have = {t[0].strip().lower() for t in tiles}
-            cand = []
-            a = find(bs, "total asset", "asset")
-            if a: cand.append(("Total assets", _usd(a.get("actual")), "from balance sheet"))
-            ln = find(bs, "net loan", "loan")
-            if ln: cand.append(("Net loans", _usd(ln.get("actual")), "from balance sheet"))
-            sh = find(bs, "share", "deposit")
-            if sh: cand.append(("Total shares", _usd(sh.get("actual")), "from balance sheet"))
-            ni = find(isr, "net income", "net")
-            if ni: cand.append(("Net income YTD", _usd(ni.get("actual")), "from income statement"))
-            for c in cand:
-                if len(tiles) >= 4: break
-                if c[0].strip().lower() not in have:
-                    tiles.append(c); have.add(c[0].strip().lower())
-        if not tiles:
-            tiles = [("No headline data", "\u2014", "headline / statements were empty in the payload")]
-        print("[highlights] rendered tiles=%s" % [t[0] for t in tiles[:4]], flush=True)
-        tiles_grid(s, tiles[:4], top, h=1.85)
+        tiles = [(h.get("label", ""), h.get("value", ""), h.get("note", ""))
+                 for h in (p.get("headline") or [])[:4] if (h.get("label") or h.get("value"))]
+        if tiles:
+            tiles_grid(s, tiles, top, h=1.85)
         # balance sheet (Actual / Budget / Variance / Prior YE \u2014 mirrors the preview BalanceTable)
         s, top = page("Statement of Financial Condition")
         pill(s, MX, top - 0.02, "sourced"); top += 0.36
