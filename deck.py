@@ -9,7 +9,7 @@ import urllib.request
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml.ns import qn
 
@@ -86,6 +86,19 @@ def _image_bytes(src):
     return None
 
 
+def _strip_theme(sp):
+    """Remove theme/scheme color refs and the style element from a shape so the
+    explicit RGB set in spPr always wins (prevents stray template accents)."""
+    el = sp._element
+    spPr = el.find(qn("p:spPr"))
+    if spPr is None: spPr = el
+    for sc in spPr.findall(".//" + qn("a:schemeClr")):
+        par = sc.getparent()
+        if par is not None: par.remove(sc)
+    style_el = el.find(qn("p:style"))
+    if style_el is not None: el.remove(style_el)
+
+
 def build(p):
     theme = p.get("theme") or {}
     NAVY = _hex(theme.get("primary"), "#16314E")
@@ -110,17 +123,17 @@ def build(p):
         s = prs.slides.add_slide(BLANK)
         r = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(-0.06), Inches(-0.06), Inches(WW + 0.12), Inches(HH + 0.12))
         r.fill.solid(); r.fill.fore_color.rgb = bg; r.line.fill.background(); r.shadow.inherit = False
+        _strip_theme(r)
         return s
 
     def rect(s, x, y, w, h, color, shape=MSO_SHAPE.RECTANGLE, radius=None, lcolor=None, lwpt=1.0):
         sp = s.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
-        st = sp._element.find(qn("p:style"))  # drop theme style ref so explicit fill always wins (no stray accent)
-        if st is not None: sp._element.remove(st)
         sp.fill.solid(); sp.fill.fore_color.rgb = color; sp.shadow.inherit = False
         if lcolor is not None:
             sp.line.color.rgb = lcolor; sp.line.width = Pt(lwpt)
         else:
             sp.line.fill.background()
+        _strip_theme(sp)  # explicit RGB must win over any template accent (e.g. red/orange)
         if radius is not None:
             try: sp.adjustments[0] = radius
             except Exception: pass
@@ -132,6 +145,7 @@ def build(p):
     def outline(s, x, y, w, h, color, wpt=1.25):
         sp = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x), Inches(y), Inches(w), Inches(h))
         sp.fill.background(); sp.line.color.rgb = color; sp.line.width = Pt(wpt); sp.shadow.inherit = False
+        _strip_theme(sp)
         return sp
 
     def txt(s, x, y, w, h, runs, align=LEFT, anchor=TOP, font="Calibri", leading=None, spacing=False):
@@ -237,7 +251,7 @@ def build(p):
         rect(s, x, y, w, h, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.07, lcolor=LINE, lwpt=1.0)
         txt(s, x + 0.26, y + 0.2, w - 0.5, 0.3, [(label, 11.5, SOFT, False)])
         txt(s, x + 0.24, y + 0.5, w - 0.46, 0.62, [(value, vsize, INK, True)], font="Calibri")
-        if note: txt(s, x + 0.26, y + h - 0.42, w - 0.5, 0.34, [(note, 10.5, FAINT, False)])
+        if note: txt(s, x + 0.26, y + h - 0.44, w - 0.5, 0.42, [(note, 10.5, FAINT, False)])
 
     def tiles_grid(s, items, top, h=1.7, cols=2):
         gx = 0.26
@@ -257,21 +271,27 @@ def build(p):
             txt(s, xs[ci] + (0.02 if ci == 0 else 0), top, widths[ci] - 0.04, rh - 0.08, [(str(htext).upper(), 9, FAINT, True)], align=al, anchor=MID)
         hline(s, MX, top + rh - 0.06, CW, LINE)
         y = top + rh
+        # Pass 1: row fills + separators, so no text can ever sit beneath a fill (z-order safe)
+        yy = y
+        for row in rows:
+            if row[1]:
+                rect(s, MX, yy, CW, rh, PAPER)
+                hline(s, MX, yy, CW, INK, thick=0.022)
+            else:
+                hline(s, MX, yy + rh - 0.012, CW, LINE, thick=0.01)
+            yy += rh
+        # Pass 2: cell text on top
+        yy = y
         for row in rows:
             cells = row[0]; total = row[1]
             cellcolors = row[2] if len(row) > 2 else None
-            if total:
-                rect(s, MX, y, CW, rh, PAPER)
-                hline(s, MX, y, CW, INK, thick=0.022)
             for ci, val in enumerate(cells):
                 al = LEFT if ci == 0 else RIGHT
                 col = (cellcolors or {}).get(ci)
                 if col is None: col = NAVY if total else INK
-                txt(s, xs[ci] + (0.04 if ci == 0 else 0), y, widths[ci] - 0.06, rh, [(val, 11.5, col, total)], align=al, anchor=MID)
-            if not total:
-                hline(s, MX, y + rh - 0.012, CW, LINE, thick=0.01)
-            y += rh
-        return y
+                txt(s, xs[ci] + (0.04 if ci == 0 else 0), yy, widths[ci] - 0.06, rh, [(val, 11.5, col, total)], align=al, anchor=MID)
+            yy += rh
+        return yy
 
     def listrow(s, x, y, w, left, right, lbold=False, lsize=11, rsize=9.5, lcolor=INK, rcolor=FAINT, metaw=1.9):
         txt(s, x, y, w - metaw, 0.3, [(left, lsize, lcolor, lbold)], anchor=MID)
@@ -306,7 +326,9 @@ def build(p):
         rect(s, x, y, w, h, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.04, lcolor=LINE, lwpt=1.0)
         txt(s, x + 0.3, y + 0.22, w - 2.0, 0.26, [(tag.upper(), 9, ACCENT, True)])
         if draft: pill(s, x + w - 1.4, y + 0.18, "draft")
-        txt(s, x + 0.3, y + 0.56, w - 0.6, h - 0.8, [(text, 13.5, INK, False)], font="Georgia", leading=1.5)
+        body = txt(s, x + 0.3, y + 0.56, w - 0.6, min(h - 0.8, 4.0), [(text, 12.5, INK, False)], font="Georgia", leading=1.4)
+        try: body.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE  # shrink long narratives to stay in-card
+        except Exception: pass
 
     # ============================ COVER ============================
     def cover():
@@ -390,10 +412,34 @@ def build(p):
         # highlights tiles
         s, top = page("Financial Highlights")
         hl = (p.get("headline") or [])[:4]
-        if hl:
-            tiles_grid(s, [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in hl], top, h=1.85)
-        else:
-            tiles_grid(s, [("No headline data", "\u2014", "headline array was empty or missing in the payload")], top, h=1.85)
+        tiles = [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in hl
+                 if (h.get("label") or h.get("value"))]
+        if len(tiles) < 4:
+            # supplement from the statements so we never fall back to stale/placeholder labels
+            bs = [r for r in (p.get("balanceSheet") or [])]
+            isr = [r for r in (p.get("incomeStatement") or [])]
+            def find(rows, *keys):
+                for k in keys:
+                    for r in rows:
+                        if k in str(r.get("label", "")).lower(): return r
+                return None
+            have = {t[0].strip().lower() for t in tiles}
+            cand = []
+            a = find(bs, "total asset", "asset")
+            if a: cand.append(("Total assets", _usd(a.get("actual")), "from balance sheet"))
+            ln = find(bs, "net loan", "loan")
+            if ln: cand.append(("Net loans", _usd(ln.get("actual")), "from balance sheet"))
+            sh = find(bs, "share", "deposit")
+            if sh: cand.append(("Total shares", _usd(sh.get("actual")), "from balance sheet"))
+            ni = find(isr, "net income", "net")
+            if ni: cand.append(("Net income YTD", _usd(ni.get("actual")), "from income statement"))
+            for c in cand:
+                if len(tiles) >= 4: break
+                if c[0].strip().lower() not in have:
+                    tiles.append(c); have.add(c[0].strip().lower())
+        if not tiles:
+            tiles = [("No headline data", "\u2014", "headline / statements were empty in the payload")]
+        tiles_grid(s, tiles[:4], top, h=1.85)
         # balance sheet (Actual / Budget / Variance / Prior YE \u2014 mirrors the preview BalanceTable)
         s, top = page("Statement of Financial Condition")
         pill(s, MX, top - 0.02, "sourced"); top += 0.36
@@ -445,7 +491,7 @@ def build(p):
         try: flagged = (dr is not None and drt is not None and abs(float(dr) - float(drt)) > 0.01)
         except Exception: flagged = False
         bottom = 6.8 - (0.9 if flagged else 0.0)  # keep tiles (+flag) above the footer
-        th = max(1.05, min(1.5 if nar else 1.7, (bottom - top) / 2 - 0.26))
+        th = max(1.2, min(1.35 if nar else 1.55, (bottom - top) / 2 - 0.26))  # tall enough for the 3-line note
         litems = [
             ("Consumer loans YTD", _M(a0.get("ytd")), (str(a0.get("goal")) + " to goal") if a0.get("goal") else ""),
             ("Mortgage loans YTD", _M(a1.get("ytd")), (str(a1.get("goal")) + " to goal") if a1.get("goal") else ""),
@@ -501,7 +547,7 @@ def build(p):
         nar = p.get("ceoNarrative") or ""
         bl = p.get("ceoHighlights") or ["No CEO report highlights were provided."]
         if nar:
-            narrcard(s, MX, top, CW, 1.5, "Drafted from submitted highlights", nar, draft=True); top += 1.95
+            narrcard(s, MX, top, CW, 1.5, "Drafted from submitted highlights", nar, draft=True); top += 2.1
         txt(s, MX, top, 8, 0.3, [("Submitted highlights", 11, NAVY, True)], font="Calibri")
         tb = s.shapes.add_textbox(Inches(MX), Inches(top + 0.4), Inches(CW), Inches(6.4 - top)); tf = tb.text_frame; tf.word_wrap = True
         for i, b in enumerate(bl[:9]):
