@@ -12,6 +12,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml.ns import qn
+from pptx.oxml import parse_xml
 
 WW, HH, MX, CW = 13.33, 7.5, 0.62, 12.09
 LEFT, RIGHT, CENTER = PP_ALIGN.LEFT, PP_ALIGN.RIGHT, PP_ALIGN.CENTER
@@ -118,6 +119,7 @@ def build(p):
     prs = Presentation(); prs.slide_width = Inches(WW); prs.slide_height = Inches(HH)
     BLANK = prs.slide_layouts[6]
     PG = [1]
+    BARID = [1000]  # unique shape ids for hand-built bar XML
 
     def slide(bg=WHITE):
         s = prs.slides.add_slide(BLANK)
@@ -247,18 +249,18 @@ def build(p):
         return s, top
 
     # white stat card (mirrors hGrid Card / hLabel / hValue / hNote)
-    def tile(s, x, y, w, h, label, value, note, vsize=26):
+    def tile(s, x, y, w, h, label, value, note, vsize=23):
         rect(s, x, y, w, h, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.07, lcolor=LINE, lwpt=1.0)
         txt(s, x + 0.26, y + 0.2, w - 0.5, 0.3, [(label, 11.5, SOFT, False)])
-        txt(s, x + 0.24, y + 0.5, w - 0.46, 0.62, [(value, vsize, INK, True)], font="Calibri")
-        if note: txt(s, x + 0.26, y + h - 0.44, w - 0.5, 0.42, [(note, 10.5, FAINT, False)])
+        txt(s, x + 0.24, y + 0.48, w - 0.46, 0.5, [(value, vsize, INK, True)], font="Calibri")
+        if note: txt(s, x + 0.26, y + h - 0.36, w - 0.5, 0.32, [(note, 10.5, FAINT, False)])
 
     def tiles_grid(s, items, top, h=1.7, cols=2):
         gx = 0.26
         w = (CW - gx * (cols - 1)) / cols
         for i, it in enumerate(items):
             l, v, n = it[0], it[1], it[2]
-            vs = it[3] if len(it) > 3 else 26
+            vs = it[3] if len(it) > 3 else 23
             tile(s, MX + (i % cols) * (w + gx), top + (i // cols) * (h + 0.26), w, h, l, v, n, vs)
 
     # book-style table: light uppercase header, hairline rows, total emphasis
@@ -315,9 +317,21 @@ def build(p):
         data = [(d[0], float(d[1])) for d in data if d and d[1] is not None]
         if not data: return
         mx = max(v for _, v in data) or 1; n = len(data); slot = w / n; bw = slot * 0.52
+        hexc = str(color)  # 'RRGGBB' — written straight into srgbClr, no theme involved
         for i, (yr, v) in enumerate(data):
             bh = (v / mx) * chart_h * 0.9; bx = x + i * slot + (slot - bw) / 2; by = base - bh
-            rect(s, bx, by, bw, max(bh, 0.02), color, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.06)
+            bhh = max(bh, 0.02)
+            BARID[0] += 1; sid = BARID[0]
+            sp_xml = (
+                '<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                '<p:nvSpPr><p:cNvPr id="%d" name="bar%d"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+                '<p:spPr><a:xfrm><a:off x="%d" y="%d"/><a:ext cx="%d" cy="%d"/></a:xfrm>'
+                '<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 16000"/></a:avLst></a:prstGeom>'
+                '<a:solidFill><a:srgbClr val="%s"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr>'
+                '<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>'
+            ) % (sid, sid, int(bx * 914400), int(by * 914400), int(bw * 914400), int(bhh * 914400), hexc)
+            s.shapes._spTree.append(parse_xml(sp_xml))
             txt(s, x + i * slot, by - 0.25, slot, 0.22, [(_M(v), 8.5, SOFT, False)], align=CENTER)
             txt(s, x + i * slot, base + 0.05, slot, 0.22, [(str(yr), 9.5, FAINT, False)], align=CENTER)
         hline(s, x, base, w, LINE)
@@ -411,7 +425,10 @@ def build(p):
 
         # highlights tiles
         s, top = page("Financial Highlights")
-        hl = (p.get("headline") or [])[:4]
+        _raw_hl = p.get("headline") or []
+        print("[highlights] incoming headline count=%d labels=%s" % (
+            len(_raw_hl), [h.get("label") for h in _raw_hl]), flush=True)
+        hl = _raw_hl[:4]
         tiles = [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in hl
                  if (h.get("label") or h.get("value"))]
         if len(tiles) < 4:
@@ -439,6 +456,7 @@ def build(p):
                     tiles.append(c); have.add(c[0].strip().lower())
         if not tiles:
             tiles = [("No headline data", "\u2014", "headline / statements were empty in the payload")]
+        print("[highlights] rendered tiles=%s" % [t[0] for t in tiles[:4]], flush=True)
         tiles_grid(s, tiles[:4], top, h=1.85)
         # balance sheet (Actual / Budget / Variance / Prior YE \u2014 mirrors the preview BalanceTable)
         s, top = page("Statement of Financial Condition")
