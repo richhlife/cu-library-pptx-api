@@ -4,11 +4,14 @@ titles, light bordered tables, white stat cards, navy dividers for break
 sections. Pure python-pptx. The client sends the active section list plus
 every section's data; this renders one or more slides per section, in order."""
 import io
+import base64
+import urllib.request
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.oxml.ns import qn
 
 WW, HH, MX, CW = 13.33, 7.5, 0.62, 12.09
 LEFT, RIGHT, CENTER = PP_ALIGN.LEFT, PP_ALIGN.RIGHT, PP_ALIGN.CENTER
@@ -19,6 +22,8 @@ PAPER = RGBColor(0xF4, 0xF6, 0xF8); LINE = RGBColor(0xE2, 0xE7, 0xEC)
 REDBG = RGBColor(0xFB, 0xEC, 0xEA); RED = RGBColor(0xB2, 0x3A, 0x30); REDINK = RGBColor(0x7A, 0x2A, 0x22)
 INK = RGBColor(0x13, 0x20, 0x2B); RING1 = RGBColor(0x35, 0x55, 0x70); RING2 = RGBColor(0x2C, 0x4A, 0x64)
 LABEL = RGBColor(0x8A, 0x9A, 0xA8); SUBWHITE = RGBColor(0xC7, 0xD2, 0xDC); POS = RGBColor(0x1F, 0x7A, 0x4D)
+NEG = RGBColor(0xB2, 0x3A, 0x30)  # mirrors --neg (variance red)
+DRAFTBG = RGBColor(0xFC, 0xEF, 0xDD); DRAFTINK = RGBColor(0xA9, 0x74, 0x1A)  # mirrors .tagDraft
 
 
 def _hex(h, default):
@@ -56,13 +61,46 @@ def _commaint(n):
         return str(n) if n is not None else ""
 
 
+def _image_bytes(src):
+    """Bytes for an image from a data: URI or http(s) URL, or None.
+    SVG and any fetch/decoding failure return None so the caller can fall
+    back to the generated mark — an image is never allowed to break the deck."""
+    if not src or not isinstance(src, str):
+        return None
+    try:
+        if src.startswith("data:"):
+            header, _, b64 = src.partition(",")
+            if "svg" in header.lower() or not b64:
+                return None
+            return base64.b64decode(b64)
+        if src.startswith("http://") or src.startswith("https://"):
+            if src.lower().split("?")[0].endswith(".svg"):
+                return None
+            req = urllib.request.Request(src, headers={"User-Agent": "cu-library-pptx"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if "svg" in (resp.headers.get("Content-Type", "") or "").lower():
+                    return None
+                return resp.read()
+    except Exception:
+        return None
+    return None
+
+
 def build(p):
-    NAVY = _hex((p.get("theme") or {}).get("primary"), "#16314E")
-    ACCENT = _hex((p.get("theme") or {}).get("accent"), "#1F9ED4")
-    name = ((p.get("theme") or {}).get("name") or "Credit Union")
+    theme = p.get("theme") or {}
+    NAVY = _hex(theme.get("primary"), "#16314E")
+    ACCENT = _hex(theme.get("accent"), "#1F9ED4")
+    ACCENT_SOFT = _hex(theme.get("accentSoft"), "#ECF2F7")
+    POSc = _hex(theme.get("pos"), "#1F7A4D")
+    NEGc = _hex(theme.get("neg"), "#B23A30")
+    logo_bytes = _image_bytes(theme.get("logoUrl"))
+    cover_bytes = _image_bytes(theme.get("coverImage"))
+    name = (theme.get("name") or "Credit Union")
     period = p.get("period") or {}
     plabel = period.get("label") or ""
-    foot = (plabel.upper() + "  \u00b7  BOARD REPORT") if plabel else "BOARD REPORT"
+    # mirrors the preview .printFooter: "{name} \u00b7 {period} Board Package \u00b7 Confidential"
+    foot = name + ((u"  \u00b7  " + plabel) if plabel else "") + u"  \u00b7  Board Package  \u00b7  Confidential"
+    runmeta = ((plabel + u"  \u00b7  Board Report") if plabel else "Board Report").upper()
 
     prs = Presentation(); prs.slide_width = Inches(WW); prs.slide_height = Inches(HH)
     BLANK = prs.slide_layouts[6]
@@ -76,6 +114,8 @@ def build(p):
 
     def rect(s, x, y, w, h, color, shape=MSO_SHAPE.RECTANGLE, radius=None, lcolor=None, lwpt=1.0):
         sp = s.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
+        st = sp._element.find(qn("p:style"))  # drop theme style ref so explicit fill always wins (no stray accent)
+        if st is not None: sp._element.remove(st)
         sp.fill.solid(); sp.fill.fore_color.rgb = color; sp.shadow.inherit = False
         if lcolor is not None:
             sp.line.color.rgb = lcolor; sp.line.width = Pt(lwpt)
@@ -107,26 +147,87 @@ def build(p):
 
     def footer(s):
         hline(s, MX, 6.96, CW, LINE)
-        txt(s, MX, 7.04, 8, 0.3, [(foot, 9, FAINT, False)])
+        txt(s, MX, 7.04, 10.6, 0.3, [(foot, 9, FAINT, False)])
         txt(s, WW - MX - 1.8, 7.04, 1.8, 0.3, [("PAGE " + str(PG[0]), 9, FAINT, False)], align=RIGHT)
+
+    def place_img(s, raw, x, y, w=None, h=None):
+        try:
+            return s.shapes.add_picture(io.BytesIO(raw), Inches(x), Inches(y),
+                                        Inches(w) if w else None, Inches(h) if h else None)
+        except Exception:
+            return None
+
+    def fill_alpha(shape, pct_opaque):
+        # set fill opacity (pct_opaque 0..100) so a cover photo shows through a wash
+        try:
+            srgb = shape.fill.fore_color._xFill.find(qn("a:srgbClr"))
+            a = srgb.makeelement(qn("a:alpha"), {"val": str(int(pct_opaque * 1000))})
+            srgb.append(a)
+        except Exception:
+            pass
+
+    initials = ("".join(w[0] for w in name.split()[:2]).upper() or "CU")
+
+    def logo_mark(s, x, y, size):
+        # real uploaded/extracted logo carries the brand itself — show it alone
+        if logo_bytes and place_img(s, logo_bytes, x, y, h=size):
+            return
+        rect(s, x, y, size, size, NAVY, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.22, lcolor=ACCENT, lwpt=1.5)
+        txt(s, x, y, size, size, [(initials, size * 34, WHITE, True)], align=CENTER, anchor=MID, font="Georgia")
+
+    def wordmark(s, x, y, color=INK, h=0.3):
+        # name with the final word in accent, mirroring the preview logoName
+        tb = s.shapes.add_textbox(Inches(x), Inches(y), Inches(7), Inches(h)); tf = tb.text_frame
+        tf.word_wrap = False; tf.vertical_anchor = MID
+        tf.margin_left = 0; tf.margin_right = 0; tf.margin_top = 0; tf.margin_bottom = 0
+        par = tf.paragraphs[0]; par.alignment = LEFT
+        words = name.split()
+        for i, wd in enumerate(words):
+            r = par.add_run(); r.text = (wd if i == 0 else " " + wd)
+            r.font.size = Pt(13); r.font.bold = True; r.font.name = "Georgia"
+            r.font.color.rgb = ACCENT if (len(words) > 1 and i == len(words) - 1) else color
+
+    TAGS = {
+        "sourced": (ACCENT_SOFT, NAVY, "From core export"),
+        "draft": (DRAFTBG, DRAFTINK, "AI draft · review"),
+        "secured": (LINE, FAINT, "• Member data · secured"),
+    }
+
+    def pill(s, x, y, kind):
+        bg, fg, label = TAGS[kind]
+        w = 0.05 * len(label) + 0.26
+        rect(s, x, y, w, 0.26, bg, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.5)
+        txt(s, x, y, w, 0.26, [(label, 8, fg, True)], align=CENTER, anchor=MID)
+        return w
+
+    def runhead(s):
+        if logo_bytes:
+            logo_mark(s, MX, 0.13, 0.34)
+        else:
+            logo_mark(s, MX, 0.15, 0.3)
+            wordmark(s, MX + 0.42, 0.15, color=INK, h=0.3)
+        txt(s, WW - MX - 4.5, 0.17, 4.5, 0.24, [(runmeta, 8.5, FAINT, True)], align=RIGHT, anchor=MID)
+        hline(s, MX, 0.5, CW, LINE, thick=0.01)
 
     # white editorial page with serif title (mirrors .vTitle / .vLead)
     def page(title, sub=None):
         PG[0] += 1
         s = slide(WHITE)
-        txt(s, MX, 0.52, CW, 0.66, [(title, 29, INK, True)], font="Georgia")
-        if sub: txt(s, MX, 1.18, CW, 0.34, [(sub, 12.5, SOFT, False)])
+        runhead(s)
+        txt(s, MX, 0.66, CW, 0.66, [(title, 29, INK, True)], font="Georgia")
+        if sub: txt(s, MX, 1.30, CW, 0.34, [(sub, 12.5, SOFT, False)])
         footer(s)
-        return s, (1.78 if sub else 1.52)
+        return s, (1.86 if sub else 1.60)
 
     # navy divider band page (mirrors .divider)
     def divider_page(title, sub=None):
         PG[0] += 1
         s = slide(WHITE)
-        rect(s, MX, 0.5, CW, 1.18, NAVY, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.06)
-        txt(s, MX + 0.4, 0.5, CW - 0.8, 1.18, [(title, 28, WHITE, True)], font="Georgia", anchor=MID)
+        runhead(s)
+        rect(s, MX, 0.66, CW, 1.18, NAVY, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.06)
+        txt(s, MX + 0.4, 0.66, CW - 0.8, 1.18, [(title, 28, WHITE, True)], font="Georgia", anchor=MID)
         footer(s)
-        top = 1.95
+        top = 2.08
         if sub:
             txt(s, MX, top, CW, 0.32, [(sub, 12.5, SOFT, False)]); top += 0.46
         return s, top
@@ -156,13 +257,17 @@ def build(p):
             txt(s, xs[ci] + (0.02 if ci == 0 else 0), top, widths[ci] - 0.04, rh - 0.08, [(str(htext).upper(), 9, FAINT, True)], align=al, anchor=MID)
         hline(s, MX, top + rh - 0.06, CW, LINE)
         y = top + rh
-        for cells, total in rows:
+        for row in rows:
+            cells = row[0]; total = row[1]
+            cellcolors = row[2] if len(row) > 2 else None
             if total:
                 rect(s, MX, y, CW, rh, PAPER)
                 hline(s, MX, y, CW, INK, thick=0.022)
             for ci, val in enumerate(cells):
                 al = LEFT if ci == 0 else RIGHT
-                txt(s, xs[ci] + (0.04 if ci == 0 else 0), y, widths[ci] - 0.06, rh, [(val, 11.5, (NAVY if total else INK), total)], align=al, anchor=MID)
+                col = (cellcolors or {}).get(ci)
+                if col is None: col = NAVY if total else INK
+                txt(s, xs[ci] + (0.04 if ci == 0 else 0), y, widths[ci] - 0.06, rh, [(val, 11.5, col, total)], align=al, anchor=MID)
             if not total:
                 hline(s, MX, y + rh - 0.012, CW, LINE, thick=0.01)
             y += rh
@@ -175,14 +280,14 @@ def build(p):
         hline(s, x, y + 0.34, w, LINE, thick=0.01)
 
     # mini card (mirrors .card + .miniTitle)
-    def minicard(s, x, y, w, h, title, meta, tag=None, tagcolor=None, body=None):
+    def minicard(s, x, y, w, h, title, meta, tag=None, tagcolor=None, body=None, tagkind=None):
         rect(s, x, y, w, h, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.07, lcolor=LINE, lwpt=1.0)
         txt(s, x + 0.22, y + 0.16, w - 0.4, 0.5, [(title, 12, INK, True)])
-        ty = y + h - 0.5
         if body:
             txt(s, x + 0.22, y + 0.5, w - 0.4, 0.45, [(body, 10, SOFT, False)], leading=1.15)
-        if meta: txt(s, x + 0.22, ty, w - 0.4, 0.22, [(meta, 9.5, FAINT, False)])
-        if tag: txt(s, x + 0.22, ty + 0.22, w - 0.4, 0.22, [(tag.upper(), 8, tagcolor or ACCENT, True)])
+        if meta: txt(s, x + 0.22, y + h - 0.62, w - 0.4, 0.22, [(meta, 9.5, FAINT, False)])
+        if tagkind: pill(s, x + 0.22, y + h - 0.36, tagkind)
+        elif tag: txt(s, x + 0.22, y + h - 0.34, w - 0.4, 0.22, [(tag.upper(), 8, tagcolor or ACCENT, True)])
 
     def bars(s, x, y, w, h, title, data, color):
         txt(s, x, y, w, 0.3, [(title, 13, INK, True)], font="Georgia")
@@ -197,16 +302,26 @@ def build(p):
             txt(s, x + i * slot, base + 0.05, slot, 0.22, [(str(yr), 9.5, FAINT, False)], align=CENTER)
         hline(s, x, base, w, LINE)
 
-    def narrcard(s, x, y, w, h, tag, text):
+    def narrcard(s, x, y, w, h, tag, text, draft=False):
         rect(s, x, y, w, h, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.04, lcolor=LINE, lwpt=1.0)
-        txt(s, x + 0.3, y + 0.22, w - 0.6, 0.26, [(tag.upper(), 9, ACCENT, True)])
+        txt(s, x + 0.3, y + 0.22, w - 2.0, 0.26, [(tag.upper(), 9, ACCENT, True)])
+        if draft: pill(s, x + w - 1.4, y + 0.18, "draft")
         txt(s, x + 0.3, y + 0.56, w - 0.6, h - 0.8, [(text, 13.5, INK, False)], font="Georgia", leading=1.5)
 
     # ============================ COVER ============================
     def cover():
         s = slide(NAVY)
+        if cover_bytes:
+            place_img(s, cover_bytes, -0.06, -0.06, w=WW + 0.12, h=HH + 0.12)
+            wash = rect(s, -0.06, -0.06, WW + 0.12, HH + 0.12, NAVY)
+            fill_alpha(wash, 62)  # navy wash so the title stays legible over the photo
         outline(s, WW - 3.2, -3.4, 7.4, 7.4, RING1)
         outline(s, WW - 1.7, -2.0, 5.0, 5.0, RING2)
+        if logo_bytes:
+            place_img(s, logo_bytes, MX + 0.3, 0.58, h=0.52)
+        else:
+            logo_mark(s, MX + 0.3, 0.6, 0.5)
+            wordmark(s, MX + 0.92, 0.6, color=WHITE, h=0.5)
         txt(s, MX + 0.3, 1.5, 11, 0.4, [(name.upper(), 13, ACCENT, True)])
         txt(s, MX + 0.27, 2.7, 11.5, 1.4, [("Board Report", 58, WHITE, True)], font="Georgia")
         if plabel: txt(s, MX + 0.3, 4.12, 11, 0.4, [(plabel.upper(), 14, SUBWHITE, False)])
@@ -244,7 +359,7 @@ def build(p):
             x = MX + (i % cols) * (w + gx); y = top + (i // cols) * (h + gy)
             sec = r.get("item") in secured
             meta = (str(r.get("owner") or "")) + ((" \u00b7 p." + str(r.get("page"))) if r.get("page") else "")
-            minicard(s, x, y, w, h, str(r.get("item", "")), meta, tag="Secured" if sec else "Sourced", tagcolor=NAVY if sec else ACCENT)
+            minicard(s, x, y, w, h, str(r.get("item", "")), meta, tagkind=("secured" if sec else "sourced"))
 
     # ============================ ACTION ITEMS ============================
     def actions():
@@ -256,7 +371,8 @@ def build(p):
             txt(s, MX + 0.3, y + 0.16, CW - 2.2, 0.4, [("(V)  " + str(a.get("policy", "")), 13.5, INK, True)], font="Georgia")
             meta = (str(a.get("owner") or "")) + ((" \u00b7 p." + str(a.get("page"))) if a.get("page") else "")
             txt(s, MX + CW - 2.0, y + 0.2, 1.8, 0.3, [(meta, 10, FAINT, False)], align=RIGHT)
-            txt(s, MX + 0.3, y + 0.58, CW - 0.6, 0.4, [(str(a.get("summary", "")), 11.5, SOFT, False)], leading=1.2)
+            txt(s, MX + 0.3, y + 0.58, CW - 1.7, 0.4, [(str(a.get("summary", "")), 11.5, SOFT, False)], leading=1.2)
+            pill(s, MX + CW - 1.4, y + h - 0.36, "sourced")
             y += h + gap
 
     # ============================ FINANCIAL (multi) ============================
@@ -264,27 +380,50 @@ def build(p):
         s, top = page("Financial Report", "Statement of financial condition " + (period.get("financialsAsOf") or ""))
         nar = p.get("narrative") or ""
         if nar:
-            narrcard(s, MX, top, CW, 5.0, "Financial narrative \u00b7 AI draft", nar)
+            nh = min(4.8, max(1.8, 0.018 * len(nar)))  # size the card to the text, no dead space
+            narrcard(s, MX, top, CW, nh, "Financial narrative \u00b7 AI draft", nar, draft=True)
+
+        def varcolor(a, b):
+            try: return POSc if float(a) >= float(b) else NEGc
+            except Exception: return None
+
         # highlights tiles
         s, top = page("Financial Highlights")
-        tiles_grid(s, [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in (p.get("headline") or [])[:4]], top, h=1.85)
-        # balance sheet
+        hl = (p.get("headline") or [])[:4]
+        if hl:
+            tiles_grid(s, [(h.get("label", ""), h.get("value", ""), h.get("note", "")) for h in hl], top, h=1.85)
+        else:
+            tiles_grid(s, [("No headline data", "\u2014", "headline array was empty or missing in the payload")], top, h=1.85)
+        # balance sheet (Actual / Budget / Variance / Prior YE \u2014 mirrors the preview BalanceTable)
         s, top = page("Statement of Financial Condition")
-        btable(s, ["Line", "Actual", "Budget", "Variance"],
-               [([r.get("label", ""), _usd(r.get("actual")), _usd(r.get("budget")), _var(r.get("actual"), r.get("budget"))], bool(r.get("total"))) for r in (p.get("balanceSheet") or [])],
-               [4.4, 2.55, 2.55, 2.55], top)
+        pill(s, MX, top - 0.02, "sourced"); top += 0.36
+        bs_rows = []
+        for r in (p.get("balanceSheet") or []):
+            a, b = r.get("actual"), r.get("budget")
+            colors = {}; vc = varcolor(a, b)
+            if vc is not None: colors[3] = vc
+            bs_rows.append(([r.get("label", ""), _usd(a), _usd(b), _var(a, b), _usd(r.get("prior"))], bool(r.get("total")), colors))
+        btable(s, ["Line", "Actual", "Budget", "Variance", "Prior YE"], bs_rows, [3.7, 2.05, 2.05, 2.2, 2.0], top)
         # income
         s, top = page("Income Statement (YTD)")
-        btable(s, ["Line (YTD)", "Actual", "Budget", "Variance"],
-               [([r.get("label", ""), _usd(r.get("actual")), _usd(r.get("budget")), _var(r.get("actual"), r.get("budget"))], bool(r.get("total"))) for r in (p.get("incomeStatement") or [])],
-               [4.4, 2.55, 2.55, 2.55], top)
+        pill(s, MX, top - 0.02, "sourced"); top += 0.36
+        is_rows = []
+        for r in (p.get("incomeStatement") or []):
+            a, b = r.get("actual"), r.get("budget")
+            colors = {}; vc = varcolor(a, b)
+            if vc is not None: colors[3] = vc
+            if r.get("net"): colors[1] = POSc
+            is_rows.append(([r.get("label", ""), _usd(a), _usd(b), _var(a, b)], bool(r.get("total")), colors))
+        btable(s, ["Line (YTD)", "Actual", "Budget", "Variance"], is_rows, [4.4, 2.55, 2.55, 2.55], top)
         # spread
         sp = p.get("spread") or []
         if sp:
             s, top = page("Spread Analysis")
+            rows_h = (len(sp) + 1) * 0.4
+            rect(s, MX, top - 0.12, CW, rows_h + 0.5, WHITE, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.03, lcolor=LINE, lwpt=1.0)
             btable(s, ["Line", "YTD 2025", "2024", "2023"],
                    [([r.get("label", ""), ("%.2f%%" % r.get("y2025")) if r.get("y2025") is not None else "", ("%.2f%%" % r.get("y2024")) if r.get("y2024") is not None else "", ("%.2f%%" % r.get("y2023")) if r.get("y2023") is not None else ""], bool(r.get("total"))) for r in sp],
-                   [5.2, 2.3, 2.3, 2.3], top)
+                   [5.2, 2.3, 2.3, 2.3], top + 0.12)
         # trends
         lt = p.get("loanTrend") or []; sht = p.get("shareTrend") or []
         if lt or sht:
@@ -300,8 +439,13 @@ def build(p):
         a0 = act[0] if len(act) > 0 else {}; a1 = act[1] if len(act) > 1 else {}
         nar = p.get("lendingNarrative") or ""
         if nar:
-            txt(s, MX, top, CW, 0.9, [(nar, 12, SOFT, False)], font="Georgia", leading=1.4); top += 1.0
-        th = 1.5 if nar else 1.7
+            adv = min(2.2, max(1.1, 0.022 * len(nar)))  # reserve room for the full paragraph
+            txt(s, MX, top, CW, adv, [(nar, 12, SOFT, False)], font="Georgia", leading=1.4); top += adv
+        dr = L.get("delinquencyRatio"); drt = L.get("delinquencyRatioTable")
+        try: flagged = (dr is not None and drt is not None and abs(float(dr) - float(drt)) > 0.01)
+        except Exception: flagged = False
+        bottom = 6.8 - (0.9 if flagged else 0.0)  # keep tiles (+flag) above the footer
+        th = max(1.05, min(1.5 if nar else 1.7, (bottom - top) / 2 - 0.26))
         litems = [
             ("Consumer loans YTD", _M(a0.get("ytd")), (str(a0.get("goal")) + " to goal") if a0.get("goal") else ""),
             ("Mortgage loans YTD", _M(a1.get("ytd")), (str(a1.get("goal")) + " to goal") if a1.get("goal") else ""),
@@ -310,9 +454,6 @@ def build(p):
         ]
         tiles_grid(s, litems, top, h=th)
         fy = top + 2 * (th + 0.26)
-        dr = L.get("delinquencyRatio"); drt = L.get("delinquencyRatioTable")
-        try: flagged = (dr is not None and drt is not None and abs(float(dr) - float(drt)) > 0.01)
-        except Exception: flagged = False
         if flagged:
             rect(s, MX, fy, CW, 0.78, REDBG, shape=MSO_SHAPE.ROUNDED_RECTANGLE, radius=0.1, lcolor=RED, lwpt=1.0)
             txt(s, MX + 0.3, fy + 0.12, 4, 0.3, [("CONSISTENCY FLAG", 10, RED, True)])
@@ -360,7 +501,7 @@ def build(p):
         nar = p.get("ceoNarrative") or ""
         bl = p.get("ceoHighlights") or ["No CEO report highlights were provided."]
         if nar:
-            narrcard(s, MX, top, CW, 1.5, "Drafted from submitted highlights", nar); top += 1.7
+            narrcard(s, MX, top, CW, 1.5, "Drafted from submitted highlights", nar, draft=True); top += 1.95
         txt(s, MX, top, 8, 0.3, [("Submitted highlights", 11, NAVY, True)], font="Calibri")
         tb = s.shapes.add_textbox(Inches(MX), Inches(top + 0.4), Inches(CW), Inches(6.4 - top)); tf = tb.text_frame; tf.word_wrap = True
         for i, b in enumerate(bl[:9]):
